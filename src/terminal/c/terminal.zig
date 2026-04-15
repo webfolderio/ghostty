@@ -1,12 +1,16 @@
 const std = @import("std");
 const testing = std.testing;
+const Allocator = std.mem.Allocator;
 const build_options = @import("terminal_options");
 const lib = @import("../lib.zig");
 const CAllocator = lib.alloc.Allocator;
 const ZigTerminal = @import("../Terminal.zig");
 const Stream = @import("../stream_terminal.zig").Stream;
+const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const PageList = @import("../PageList.zig");
+const FlattenedHighlight = @import("../highlight.zig").Flattened;
+const searchpkg = @import("../search.zig");
 const kitty = @import("../kitty/key.zig");
 const kitty_gfx_c = @import("kitty_graphics.zig");
 const modes = @import("../modes.zig");
@@ -33,6 +37,62 @@ const TerminalWrapper = struct {
     terminal: *ZigTerminal,
     stream: Stream,
     effects: Effects = .{},
+    search_state: ?SearchState = null,
+};
+
+const SearchScreenState = struct {
+    searcher: searchpkg.Screen,
+    dirty: bool = false,
+
+    fn deinit(self: *SearchScreenState) void {
+        self.searcher.deinit();
+        self.* = undefined;
+    }
+};
+
+const SearchState = struct {
+    needle: []u8,
+    primary: ?SearchScreenState = null,
+    alternate: ?SearchScreenState = null,
+
+    fn init(alloc: Allocator, needle: []const u8) Allocator.Error!SearchState {
+        return .{
+            .needle = try alloc.dupe(u8, needle),
+        };
+    }
+
+    fn deinit(self: *SearchState, alloc: Allocator) void {
+        self.clearSearchers();
+        alloc.free(self.needle);
+        self.* = undefined;
+    }
+
+    fn screenState(self: *SearchState, key: ScreenSet.Key) *?SearchScreenState {
+        return switch (key) {
+            .primary => &self.primary,
+            .alternate => &self.alternate,
+        };
+    }
+
+    fn clearSearchers(self: *SearchState) void {
+        if (self.primary) |*state| {
+            state.deinit();
+            self.primary = null;
+        }
+        if (self.alternate) |*state| {
+            state.deinit();
+            self.alternate = null;
+        }
+    }
+
+    fn markDirty(self: *SearchState, key: ScreenSet.Key) void {
+        if (self.screenState(key).*) |*state| state.dirty = true;
+    }
+
+    fn markAllDirty(self: *SearchState) void {
+        if (self.primary) |*state| state.dirty = true;
+        if (self.alternate) |*state| state.dirty = true;
+    }
 };
 
 /// C callback state for terminal effects. Trampolines are always
@@ -214,6 +274,28 @@ pub const Options = extern struct {
     max_scrollback: usize,
 };
 
+pub const SearchDirection = enum(c_int) {
+    next = 0,
+    previous = 1,
+};
+
+pub const SearchStatus = extern struct {
+    total: usize,
+    selected: usize,
+    has_selected: bool,
+};
+
+pub const SearchMatch = extern struct {
+    start: point.Coordinate,
+    end: point.Coordinate,
+};
+
+pub const SearchIndexedMatch = extern struct {
+    index: usize,
+    start: point.Coordinate,
+    end: point.Coordinate,
+};
+
 const NewError = error{
     InvalidValue,
     OutOfMemory,
@@ -280,6 +362,161 @@ fn new_(
     return wrapper;
 }
 
+fn initSearchScreenState(
+    wrapper: *TerminalWrapper,
+    needle: []const u8,
+) Allocator.Error!SearchScreenState {
+    var state: SearchScreenState = .{
+        .searcher = try .init(
+            wrapper.terminal.gpa(),
+            wrapper.terminal.screens.active,
+            needle,
+        ),
+    };
+    errdefer state.searcher.deinit();
+    try state.searcher.searchAll();
+    return state;
+}
+
+fn syncSearchState(wrapper: *TerminalWrapper) Result {
+    const state = if (wrapper.search_state) |*value| value else return .no_value;
+    const screen_state = screen_state: {
+        const slot = state.screenState(wrapper.terminal.screens.active_key);
+        if (slot.* == null) {
+            slot.* = initSearchScreenState(wrapper, state.needle) catch
+                return .out_of_memory;
+        }
+        break :screen_state &(slot.*.?);
+    };
+
+    if (!screen_state.dirty) return .success;
+
+    screen_state.searcher.feed() catch return .out_of_memory;
+    screen_state.searcher.reloadActive() catch return .out_of_memory;
+    screen_state.searcher.searchAll() catch return .out_of_memory;
+    screen_state.dirty = false;
+    return .success;
+}
+
+fn flattenedSearchMatch(
+    searcher: *searchpkg.Screen,
+    flattened: FlattenedHighlight,
+) ?SearchMatch {
+    const start = searcher.screen.pages.pointFromPin(.screen, flattened.startPin()) orelse
+        return null;
+    const end = searcher.screen.pages.pointFromPin(.screen, flattened.endPin()) orelse
+        return null;
+
+    return .{
+        .start = start.coord(),
+        .end = end.coord(),
+    };
+}
+
+fn selectedSearchMatch(state: *SearchScreenState) ?SearchMatch {
+    const selected = state.searcher.selectedMatch() orelse return null;
+    return flattenedSearchMatch(&state.searcher, selected);
+}
+
+fn flattenedIndexedSearchMatch(
+    state: *SearchScreenState,
+    index: usize,
+    flattened: FlattenedHighlight,
+) ?SearchIndexedMatch {
+    const match = flattenedSearchMatch(&state.searcher, flattened) orelse return null;
+    return .{
+        .index = index,
+        .start = match.start,
+        .end = match.end,
+    };
+}
+
+fn indexedSearchMatchForHighlight(
+    state: *SearchScreenState,
+    flattened: FlattenedHighlight,
+) ?SearchIndexedMatch {
+    const needle = flattened.untracked();
+    const active_results = state.searcher.active_results.items;
+    var i = active_results.len;
+    while (i > 0) {
+        i -= 1;
+        const idx = active_results.len - 1 - i;
+        if (active_results[i].untracked().eql(needle)) {
+            return flattenedIndexedSearchMatch(state, idx, active_results[i]);
+        }
+    }
+
+    for (state.searcher.history_results.items, 0..) |candidate, history_idx| {
+        if (candidate.untracked().eql(needle)) {
+            return flattenedIndexedSearchMatch(
+                state,
+                active_results.len + history_idx,
+                candidate,
+            );
+        }
+    }
+
+    return null;
+}
+
+fn matchIntersectsViewport(flattened: FlattenedHighlight, screen: *Screen) bool {
+    var it = screen.pages.pageIterator(
+        .right_down,
+        .{ .viewport = .{} },
+        null,
+    );
+    const chunks = flattened.chunks.slice();
+    while (it.next()) |chunk| {
+        for (0..chunks.len) |i| {
+            if (chunk.overlaps(.{
+                .node = chunks.items(.node)[i],
+                .start = chunks.items(.start)[i],
+                .end = chunks.items(.end)[i],
+            })) return true;
+        }
+    }
+
+    return false;
+}
+
+fn collectViewportMatches(
+    alloc: Allocator,
+    state: *SearchScreenState,
+) Allocator.Error!std.ArrayList(SearchIndexedMatch) {
+    var viewport: searchpkg.Viewport = try .init(alloc, state.searcher.needle());
+    defer viewport.deinit();
+    _ = try viewport.update(&state.searcher.screen.pages);
+
+    var matches: std.ArrayList(SearchIndexedMatch) = .empty;
+    errdefer matches.deinit(alloc);
+    while (viewport.next()) |flattened| {
+        const indexed = indexedSearchMatchForHighlight(state, flattened) orelse continue;
+        try matches.append(alloc, indexed);
+    }
+
+    return matches;
+}
+
+fn selectSearchIndex(state: *SearchScreenState, index: usize) Result {
+    const active_len = state.searcher.active_results.items.len;
+    const history_len = state.searcher.history_results.items.len;
+    if (index >= active_len + history_len) return .no_value;
+
+    const flattened = if (index < active_len)
+        state.searcher.active_results.items[active_len - 1 - index]
+    else
+        state.searcher.history_results.items[index - active_len];
+    const tracked = flattened.untracked().track(state.searcher.screen) catch
+        return .out_of_memory;
+
+    if (state.searcher.selected) |*selected| selected.deinit(state.searcher.screen);
+    state.searcher.selected = .{
+        .idx = index,
+        .highlight = tracked,
+    };
+    return .success;
+}
+
 pub fn vt_write(
     terminal_: Terminal,
     ptr: [*]const u8,
@@ -287,6 +524,242 @@ pub fn vt_write(
 ) callconv(lib.calling_conv) void {
     const wrapper = terminal_ orelse return;
     wrapper.stream.nextSlice(ptr[0..len]);
+    if (wrapper.search_state) |*state| state.markDirty(wrapper.terminal.screens.active_key);
+}
+
+pub fn search_set(
+    terminal_: Terminal,
+    ptr: ?[*]const u8,
+    len: usize,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    if (len == 0) return search_clear(terminal_);
+    const needle = (ptr orelse return .invalid_value)[0..len];
+    const alloc = wrapper.terminal.gpa();
+    var next = SearchState.init(alloc, needle) catch return .out_of_memory;
+    errdefer next.deinit(alloc);
+    next.screenState(wrapper.terminal.screens.active_key).* =
+        initSearchScreenState(wrapper, next.needle) catch return .out_of_memory;
+    if (wrapper.search_state) |*state| state.deinit(alloc);
+    wrapper.search_state = next;
+    return .success;
+}
+
+pub fn search_clear(terminal_: Terminal) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const alloc = wrapper.terminal.gpa();
+    if (wrapper.search_state) |*state| {
+        state.deinit(alloc);
+        wrapper.search_state = null;
+    }
+    return .success;
+}
+
+pub fn search_select(
+    terminal_: Terminal,
+    direction: SearchDirection,
+) callconv(lib.calling_conv) Result {
+    if (comptime std.debug.runtime_safety) {
+        _ = std.meta.intToEnum(SearchDirection, @intFromEnum(direction)) catch {
+            log.warn("terminal_search_select invalid direction value={d}", .{@intFromEnum(direction)});
+            return .invalid_value;
+        };
+    }
+
+    const wrapper = terminal_ orelse return .invalid_value;
+    const sync_result = syncSearchState(wrapper);
+    if (sync_result != .success) return sync_result;
+
+    const search_state = if (wrapper.search_state) |*value| value else return .no_value;
+    const state = if (search_state.screenState(wrapper.terminal.screens.active_key).*) |*value|
+        value
+    else
+        return .no_value;
+    const selected = state.searcher.select(switch (direction) {
+        .next => .next,
+        .previous => .prev,
+    }) catch return .out_of_memory;
+    if (!selected) return .no_value;
+
+    const match = state.searcher.selectedMatch() orelse return .no_value;
+    if (!matchIntersectsViewport(match, state.searcher.screen)) {
+        state.searcher.screen.scroll(.{ .pin = match.startPin() });
+    }
+
+    return .success;
+}
+
+pub fn search_select_index(
+    terminal_: Terminal,
+    index: usize,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const sync_result = syncSearchState(wrapper);
+    if (sync_result != .success) return sync_result;
+
+    const search_state = if (wrapper.search_state) |*value| value else return .no_value;
+    const state = if (search_state.screenState(wrapper.terminal.screens.active_key).*) |*value|
+        value
+    else
+        return .no_value;
+    const result = selectSearchIndex(state, index);
+    if (result != .success) return result;
+
+    const match = state.searcher.selectedMatch() orelse return .no_value;
+    if (!matchIntersectsViewport(match, state.searcher.screen)) {
+        state.searcher.screen.scroll(.{ .pin = match.startPin() });
+    }
+
+    return .success;
+}
+
+pub fn search_status(
+    terminal_: Terminal,
+    out: ?*SearchStatus,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const sync_result = syncSearchState(wrapper);
+    if (sync_result != .success) return sync_result;
+
+    const search_state = if (wrapper.search_state) |*value| value else return .no_value;
+    const state = if (search_state.screenState(wrapper.terminal.screens.active_key).*) |*value|
+        value
+    else
+        return .no_value;
+    if (out) |target| {
+        target.* = .{
+            .total = state.searcher.matchesLen(),
+            .selected = 0,
+            .has_selected = false,
+        };
+
+        if (state.searcher.selected) |selected| {
+            target.selected = selected.idx;
+            target.has_selected = true;
+        }
+    }
+
+    return .success;
+}
+
+pub fn search_selected(
+    terminal_: Terminal,
+    out: ?*SearchMatch,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const sync_result = syncSearchState(wrapper);
+    if (sync_result != .success) return sync_result;
+
+    const search_state = if (wrapper.search_state) |*value| value else return .no_value;
+    const state = if (search_state.screenState(wrapper.terminal.screens.active_key).*) |*value|
+        value
+    else
+        return .no_value;
+    const match = selectedSearchMatch(state) orelse return .no_value;
+    if (out) |target| target.* = match;
+    return .success;
+}
+
+pub fn search_viewport_matches_len(
+    terminal_: Terminal,
+    out: ?*usize,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const sync_result = syncSearchState(wrapper);
+    if (sync_result != .success) return sync_result;
+
+    const search_state = if (wrapper.search_state) |*value| value else return .no_value;
+    const state = if (search_state.screenState(wrapper.terminal.screens.active_key).*) |*value|
+        value
+    else
+        return .no_value;
+
+    const alloc = wrapper.terminal.gpa();
+    var matches = collectViewportMatches(alloc, state) catch return .out_of_memory;
+    defer matches.deinit(alloc);
+
+    if (out) |target| target.* = matches.items.len;
+    return .success;
+}
+
+pub fn search_viewport_matches(
+    terminal_: Terminal,
+    out: ?[*]SearchIndexedMatch,
+    out_len: usize,
+    out_written: ?*usize,
+) callconv(lib.calling_conv) Result {
+    if (out_len > 0 and out == null) return .invalid_value;
+
+    const wrapper = terminal_ orelse return .invalid_value;
+    const sync_result = syncSearchState(wrapper);
+    if (sync_result != .success) return sync_result;
+
+    const search_state = if (wrapper.search_state) |*value| value else return .no_value;
+    const state = if (search_state.screenState(wrapper.terminal.screens.active_key).*) |*value|
+        value
+    else
+        return .no_value;
+
+    const alloc = wrapper.terminal.gpa();
+    var matches = collectViewportMatches(alloc, state) catch return .out_of_memory;
+    defer matches.deinit(alloc);
+
+    if (out_written) |target| target.* = matches.items.len;
+    if (out_len < matches.items.len) return .out_of_space;
+    if (matches.items.len == 0) return .success;
+
+    @memcpy(out.?[0..matches.items.len], matches.items);
+    return .success;
+}
+
+pub fn search_matches(
+    terminal_: Terminal,
+    out: ?[*]SearchIndexedMatch,
+    out_len: usize,
+    out_written: ?*usize,
+) callconv(lib.calling_conv) Result {
+    if (out_len > 0 and out == null) return .invalid_value;
+
+    const wrapper = terminal_ orelse return .invalid_value;
+    const sync_result = syncSearchState(wrapper);
+    if (sync_result != .success) return sync_result;
+
+    const search_state = if (wrapper.search_state) |*value| value else return .no_value;
+    const state = if (search_state.screenState(wrapper.terminal.screens.active_key).*) |*value|
+        value
+    else
+        return .no_value;
+
+    const active_len = state.searcher.active_results.items.len;
+    const total = active_len + state.searcher.history_results.items.len;
+    if (out_written) |target| target.* = total;
+    if (out_len < total) return .out_of_space;
+
+    if (total == 0) return .success;
+    const target = out.?[0..total];
+
+    var written: usize = 0;
+    var i = active_len;
+    while (i > 0) {
+        i -= 1;
+        target[written] = flattenedIndexedSearchMatch(
+            state,
+            written,
+            state.searcher.active_results.items[i],
+        ) orelse return .no_value;
+        written += 1;
+    }
+
+    for (state.searcher.history_results.items, 0..) |flattened, history_idx| {
+        target[written] = flattenedIndexedSearchMatch(
+            state,
+            active_len + history_idx,
+            flattened,
+        ) orelse return .no_value;
+        written += 1;
+    }
+
+    return .success;
 }
 
 /// C: GhosttyTerminalOption
@@ -484,11 +957,15 @@ pub fn resize(
         func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len);
     }
 
+    if (wrapper.search_state) |*state| state.markAllDirty();
+
     return .success;
 }
 
 pub fn reset(terminal_: Terminal) callconv(lib.calling_conv) void {
-    const t: *ZigTerminal = (terminal_ orelse return).terminal;
+    const wrapper = terminal_ orelse return;
+    const t: *ZigTerminal = wrapper.terminal;
+    if (wrapper.search_state) |*state| state.clearSearchers();
     t.fullReset();
 }
 
@@ -717,6 +1194,7 @@ pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
 
     wrapper.stream.deinit();
     const alloc = t.gpa();
+    if (wrapper.search_state) |*state| state.deinit(alloc);
     t.deinit(alloc);
     alloc.destroy(t);
     alloc.destroy(wrapper);
@@ -736,6 +1214,256 @@ test "new/free" {
 
     try testing.expect(t != null);
     free(t);
+}
+
+test "search set select status clear" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 16,
+            .rows = 2,
+            .max_scrollback = 32,
+        },
+    ));
+    defer free(t);
+
+    const text = "alpha\r\nbeta\r\nalpha";
+    vt_write(t, text, text.len);
+
+    const needle = "alpha";
+    try testing.expectEqual(Result.success, search_set(t, needle, needle.len));
+
+    var status: SearchStatus = undefined;
+    try testing.expectEqual(Result.success, search_status(t, &status));
+    try testing.expectEqual(@as(usize, 2), status.total);
+    try testing.expect(!status.has_selected);
+
+    var match: SearchMatch = undefined;
+    try testing.expectEqual(Result.no_value, search_selected(t, &match));
+
+    try testing.expectEqual(Result.success, search_select(t, .next));
+    try testing.expectEqual(Result.success, search_status(t, &status));
+    try testing.expect(status.has_selected);
+    try testing.expectEqual(@as(usize, 0), status.selected);
+    try testing.expectEqual(Result.success, search_selected(t, &match));
+    try testing.expectEqual(@as(size.CellCountInt, 0), match.start.x);
+    try testing.expectEqual(@as(u32, 2), match.start.y);
+    try testing.expectEqual(@as(size.CellCountInt, 4), match.end.x);
+    try testing.expectEqual(@as(u32, 2), match.end.y);
+
+    try testing.expectEqual(Result.success, search_select(t, .next));
+    try testing.expectEqual(Result.success, search_status(t, &status));
+    try testing.expect(status.has_selected);
+    try testing.expectEqual(@as(usize, 1), status.selected);
+    try testing.expectEqual(Result.success, search_selected(t, &match));
+    try testing.expectEqual(@as(size.CellCountInt, 0), match.start.x);
+    try testing.expectEqual(@as(u32, 0), match.start.y);
+    try testing.expectEqual(@as(size.CellCountInt, 4), match.end.x);
+    try testing.expectEqual(@as(u32, 0), match.end.y);
+    try testing.expectEqual(@as(usize, 0), t.?.terminal.screens.active.pages.scrollbar().offset);
+
+    try testing.expectEqual(Result.success, search_clear(t));
+    try testing.expectEqual(Result.no_value, search_status(t, &status));
+}
+
+test "search refreshes after writes and reset" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 16,
+            .rows = 2,
+            .max_scrollback = 32,
+        },
+    ));
+    defer free(t);
+
+    const initial = "alpha\r\nbeta";
+    vt_write(t, initial, initial.len);
+
+    const needle = "alpha";
+    try testing.expectEqual(Result.success, search_set(t, needle, needle.len));
+
+    var status: SearchStatus = undefined;
+    try testing.expectEqual(Result.success, search_status(t, &status));
+    try testing.expectEqual(@as(usize, 1), status.total);
+    try testing.expect(!status.has_selected);
+
+    const appended = "\r\nalpha";
+    vt_write(t, appended, appended.len);
+
+    try testing.expectEqual(Result.success, search_status(t, &status));
+    try testing.expectEqual(@as(usize, 2), status.total);
+    try testing.expect(!status.has_selected);
+
+    reset(t);
+
+    try testing.expectEqual(Result.success, search_status(t, &status));
+    try testing.expectEqual(@as(usize, 0), status.total);
+    try testing.expect(!status.has_selected);
+}
+
+test "search preserves per-screen state across screen switches" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 16,
+            .rows = 2,
+            .max_scrollback = 32,
+        },
+    ));
+    defer free(t);
+
+    const primary = "alpha";
+    vt_write(t, primary, primary.len);
+
+    const needle = "alpha";
+    try testing.expectEqual(Result.success, search_set(t, needle, needle.len));
+    try testing.expectEqual(Result.success, search_select(t, .next));
+
+    var status: SearchStatus = undefined;
+    try testing.expectEqual(Result.success, search_status(t, &status));
+    try testing.expectEqual(@as(usize, 1), status.total);
+    try testing.expect(status.has_selected);
+
+    const enter_alt = "\x1B[?1049h";
+    vt_write(t, enter_alt, enter_alt.len);
+
+    try testing.expectEqual(Result.success, search_status(t, &status));
+    try testing.expectEqual(@as(usize, 0), status.total);
+    try testing.expect(!status.has_selected);
+
+    const leave_alt = "\x1B[?1049l";
+    vt_write(t, leave_alt, leave_alt.len);
+
+    var match: SearchMatch = undefined;
+    try testing.expectEqual(Result.success, search_status(t, &status));
+    try testing.expectEqual(@as(usize, 1), status.total);
+    try testing.expect(status.has_selected);
+    try testing.expectEqual(@as(usize, 0), status.selected);
+    try testing.expectEqual(Result.success, search_selected(t, &match));
+    try testing.expectEqual(@as(size.CellCountInt, 0), match.start.x);
+    try testing.expectEqual(@as(u32, 0), match.start.y);
+    try testing.expectEqual(@as(size.CellCountInt, 4), match.end.x);
+    try testing.expectEqual(@as(u32, 0), match.end.y);
+}
+
+test "search viewport matches and select index" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 16,
+            .rows = 2,
+            .max_scrollback = 32,
+        },
+    ));
+    defer free(t);
+
+    const text = "zero\r\none\r\nzero\r\ntwo";
+    vt_write(t, text, text.len);
+
+    const needle = "zero";
+    try testing.expectEqual(Result.success, search_set(t, needle, needle.len));
+
+    var viewport_len: usize = 0;
+    try testing.expectEqual(Result.success, search_viewport_matches_len(t, &viewport_len));
+    try testing.expectEqual(@as(usize, 2), viewport_len);
+
+    var viewport_written: usize = 0;
+    var viewport_matches: [2]SearchIndexedMatch = undefined;
+    try testing.expectEqual(Result.success, search_viewport_matches(
+        t,
+        &viewport_matches,
+        viewport_matches.len,
+        &viewport_written,
+    ));
+    try testing.expectEqual(@as(usize, 2), viewport_written);
+    try testing.expect(
+        (viewport_matches[0].index == 0 and viewport_matches[0].start.y == 2) or
+            (viewport_matches[1].index == 0 and viewport_matches[1].start.y == 2),
+    );
+    try testing.expect(
+        (viewport_matches[0].index == 1 and viewport_matches[0].start.y == 0) or
+            (viewport_matches[1].index == 1 and viewport_matches[1].start.y == 0),
+    );
+
+    var total_written: usize = 0;
+    var matches: [2]SearchIndexedMatch = undefined;
+    try testing.expectEqual(Result.success, search_matches(
+        t,
+        &matches,
+        matches.len,
+        &total_written,
+    ));
+    try testing.expectEqual(@as(usize, 2), total_written);
+    try testing.expectEqual(@as(usize, 0), matches[0].index);
+    try testing.expectEqual(@as(u32, 2), matches[0].start.y);
+    try testing.expectEqual(@as(usize, 1), matches[1].index);
+    try testing.expectEqual(@as(u32, 0), matches[1].start.y);
+
+    try testing.expectEqual(Result.success, search_select_index(t, 1));
+
+    var status: SearchStatus = undefined;
+    try testing.expectEqual(Result.success, search_status(t, &status));
+    try testing.expect(status.has_selected);
+    try testing.expectEqual(@as(usize, 1), status.selected);
+
+    var match: SearchMatch = undefined;
+    try testing.expectEqual(Result.success, search_selected(t, &match));
+    try testing.expectEqual(@as(u32, 0), match.start.y);
+}
+
+test "search reset while alternate screen is active is safe" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 16,
+            .rows = 2,
+            .max_scrollback = 32,
+        },
+    ));
+    defer free(t);
+
+    const needle = "alpha";
+    vt_write(t, needle, needle.len);
+    try testing.expectEqual(Result.success, search_set(t, needle, needle.len));
+
+    const enter_alt = "\x1B[?1049h";
+    vt_write(t, enter_alt, enter_alt.len);
+    vt_write(t, needle, needle.len);
+    try testing.expectEqual(Result.success, search_select(t, .next));
+
+    reset(t);
+
+    var status: SearchStatus = undefined;
+    try testing.expectEqual(Result.success, search_status(t, &status));
+    try testing.expectEqual(@as(usize, 0), status.total);
+    try testing.expect(!status.has_selected);
+}
+
+test "search set validates pointer" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 16,
+            .rows = 2,
+            .max_scrollback = 32,
+        },
+    ));
+    defer free(t);
+
+    try testing.expectEqual(Result.invalid_value, search_set(t, null, 5));
 }
 
 test "new invalid value" {

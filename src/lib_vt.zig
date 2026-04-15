@@ -229,6 +229,15 @@ comptime {
         @export(&c.terminal_resize, .{ .name = "ghostty_terminal_resize" });
         @export(&c.terminal_set, .{ .name = "ghostty_terminal_set" });
         @export(&c.terminal_vt_write, .{ .name = "ghostty_terminal_vt_write" });
+        @export(&c.terminal_search_set, .{ .name = "ghostty_terminal_search_set" });
+        @export(&c.terminal_search_clear, .{ .name = "ghostty_terminal_search_clear" });
+        @export(&c.terminal_search_select, .{ .name = "ghostty_terminal_search_select" });
+        @export(&c.terminal_search_select_index, .{ .name = "ghostty_terminal_search_select_index" });
+        @export(&c.terminal_search_status, .{ .name = "ghostty_terminal_search_status" });
+        @export(&c.terminal_search_selected, .{ .name = "ghostty_terminal_search_selected" });
+        @export(&c.terminal_search_viewport_matches_len, .{ .name = "ghostty_terminal_search_viewport_matches_len" });
+        @export(&c.terminal_search_viewport_matches, .{ .name = "ghostty_terminal_search_viewport_matches" });
+        @export(&c.terminal_search_matches, .{ .name = "ghostty_terminal_search_matches" });
         @export(&c.terminal_scroll_viewport, .{ .name = "ghostty_terminal_scroll_viewport" });
         @export(&c.terminal_mode_get, .{ .name = "ghostty_terminal_mode_get" });
         @export(&c.terminal_mode_set, .{ .name = "ghostty_terminal_mode_set" });

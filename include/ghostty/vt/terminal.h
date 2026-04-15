@@ -249,6 +249,29 @@ typedef struct {
   uint64_t len;
 } GhosttyTerminalScrollbar;
 
+typedef enum GHOSTTY_ENUM_TYPED {
+  GHOSTTY_TERMINAL_SEARCH_NEXT = 0,
+  GHOSTTY_TERMINAL_SEARCH_PREVIOUS = 1,
+  GHOSTTY_TERMINAL_SEARCH_DIRECTION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyTerminalSearchDirection;
+
+typedef struct {
+  size_t total;
+  size_t selected;
+  bool has_selected;
+} GhosttyTerminalSearchStatus;
+
+typedef struct {
+  GhosttyPointCoordinate start;
+  GhosttyPointCoordinate end;
+} GhosttyTerminalSearchMatch;
+
+typedef struct {
+  size_t index;
+  GhosttyPointCoordinate start;
+  GhosttyPointCoordinate end;
+} GhosttyTerminalSearchIndexedMatch;
+
 /**
  * Callback function type for bell.
  *
@@ -966,6 +989,44 @@ GHOSTTY_API GhosttyResult ghostty_terminal_set(GhosttyTerminal terminal,
 GHOSTTY_API void ghostty_terminal_vt_write(GhosttyTerminal terminal,
                                 const uint8_t* data,
                                 size_t len);
+
+GHOSTTY_API GhosttyResult ghostty_terminal_search_set(GhosttyTerminal terminal,
+                                           const uint8_t* needle,
+                                           size_t needle_len);
+
+GHOSTTY_API GhosttyResult ghostty_terminal_search_clear(GhosttyTerminal terminal);
+
+GHOSTTY_API GhosttyResult ghostty_terminal_search_select(
+    GhosttyTerminal terminal,
+    GhosttyTerminalSearchDirection direction);
+
+GHOSTTY_API GhosttyResult ghostty_terminal_search_select_index(
+    GhosttyTerminal terminal,
+    size_t index);
+
+GHOSTTY_API GhosttyResult ghostty_terminal_search_status(
+    GhosttyTerminal terminal,
+    GhosttyTerminalSearchStatus* out);
+
+GHOSTTY_API GhosttyResult ghostty_terminal_search_selected(
+    GhosttyTerminal terminal,
+    GhosttyTerminalSearchMatch* out);
+
+GHOSTTY_API GhosttyResult ghostty_terminal_search_viewport_matches_len(
+    GhosttyTerminal terminal,
+    size_t* out);
+
+GHOSTTY_API GhosttyResult ghostty_terminal_search_viewport_matches(
+    GhosttyTerminal terminal,
+    GhosttyTerminalSearchIndexedMatch* out,
+    size_t out_len,
+    size_t* out_written);
+
+GHOSTTY_API GhosttyResult ghostty_terminal_search_matches(
+    GhosttyTerminal terminal,
+    GhosttyTerminalSearchIndexedMatch* out,
+    size_t out_len,
+    size_t* out_written);
 
 /**
  * Scroll the terminal viewport.
