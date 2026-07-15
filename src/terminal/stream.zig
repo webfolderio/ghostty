@@ -1879,6 +1879,7 @@ pub fn Stream(comptime H: type) type {
                         }
 
                         const mode_raw = input.params[0];
+                        // Preserve the ANSI tag so the response doesn't gain DEC's '?' prefix.
                         if (mode_raw == 25 and ansi_mode) {
                             self.handler.vt(.request_mode_unknown, .{
                                 .mode = mode_raw,

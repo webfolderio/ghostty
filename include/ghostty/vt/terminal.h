@@ -1345,6 +1345,7 @@ GHOSTTY_API GhosttyResult ghostty_terminal_search_set(GhosttyTerminal terminal,
 
 GHOSTTY_API GhosttyResult ghostty_terminal_search_clear(GhosttyTerminal terminal);
 
+/* Selection changes search state only; the embedder owns viewport scrolling. */
 GHOSTTY_API GhosttyResult ghostty_terminal_search_select(
     GhosttyTerminal terminal,
     GhosttyTerminalSearchDirection direction);
