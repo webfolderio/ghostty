@@ -547,26 +547,6 @@ fn flattenedIndexedSearchMatch(
     };
 }
 
-fn matchIntersectsViewport(flattened: FlattenedHighlight, screen: *Screen) bool {
-    var it = screen.pages.pageIterator(
-        .right_down,
-        .{ .viewport = .{} },
-        null,
-    );
-    const chunks = flattened.chunks.slice();
-    while (it.next()) |chunk| {
-        for (0..chunks.len) |i| {
-            if (chunk.overlaps(.{
-                .node = chunks.items(.node)[i],
-                .start = chunks.items(.start)[i],
-                .end = chunks.items(.end)[i],
-            })) return true;
-        }
-    }
-
-    return false;
-}
-
 const ViewportChunk = struct {
     serial: u64,
     start: size.CellCountInt,
@@ -707,12 +687,6 @@ pub fn search_select(
         .previous => .prev,
     }) catch return .out_of_memory;
     if (!selected) return .no_value;
-
-    const match = state.searcher.selectedMatch() orelse return .no_value;
-    if (!matchIntersectsViewport(match, state.searcher.screen)) {
-        state.searcher.screen.scroll(.{ .pin = match.startPin() });
-    }
-
     return .success;
 }
 
@@ -729,15 +703,7 @@ pub fn search_select_index(
         value
     else
         return .no_value;
-    const result = selectSearchIndex(state, index);
-    if (result != .success) return result;
-
-    const match = state.searcher.selectedMatch() orelse return .no_value;
-    if (!matchIntersectsViewport(match, state.searcher.screen)) {
-        state.searcher.screen.scroll(.{ .pin = match.startPin() });
-    }
-
-    return .success;
+    return selectSearchIndex(state, index);
 }
 
 pub fn search_status(
@@ -1545,7 +1511,7 @@ test "search set select status clear" {
     try testing.expectEqual(@as(u32, 0), match.start.y);
     try testing.expectEqual(@as(size.CellCountInt, 4), match.end.x);
     try testing.expectEqual(@as(u32, 0), match.end.y);
-    try testing.expectEqual(@as(usize, 0), t.?.terminal.screens.active.pages.scrollbar().offset);
+    try testing.expectEqual(@as(usize, 1), t.?.terminal.screens.active.pages.scrollbar().offset);
 
     try testing.expectEqual(Result.success, search_clear(t));
     try testing.expectEqual(Result.no_value, search_status(t, &status));
