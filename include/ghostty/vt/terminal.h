@@ -87,7 +87,7 @@ extern "C" {
  * | `GHOSTTY_TERMINAL_OPT_WRITE_PTY`        | `GhosttyTerminalWritePtyFn`       | Query responses written back to the pty   |
  * | `GHOSTTY_TERMINAL_OPT_BELL`             | `GhosttyTerminalBellFn`           | BEL character (0x07)                      |
  * | `GHOSTTY_TERMINAL_OPT_TITLE_CHANGED`    | `GhosttyTerminalTitleChangedFn`   | Title change via OSC 0 / OSC 2            |
- * | `GHOSTTY_TERMINAL_OPT_PWD_CHANGED`      | `GhosttyTerminalPwdChangedFn`     | Pwd change via OSC 7 / OSC 9 / OSC 1337   |
+ * | `GHOSTTY_TERMINAL_OPT_PWD_CHANGED`      | `GhosttyTerminalPwdChangedFn`     | Pwd change or clear via OSC/RIS            |
  * | `GHOSTTY_TERMINAL_OPT_ENQUIRY`          | `GhosttyTerminalEnquiryFn`        | ENQ character (0x05)                      |
  * | `GHOSTTY_TERMINAL_OPT_XTVERSION`        | `GhosttyTerminalXtversionFn`      | XTVERSION query (CSI > q)                 |
  * | `GHOSTTY_TERMINAL_OPT_SIZE`             | `GhosttyTerminalSizeFn`           | XTWINOPS size query (CSI 14/16/18 t)      |
@@ -594,8 +594,8 @@ typedef void (*GhosttyTerminalTitleChangedFn)(GhosttyTerminal terminal,
  * responsible for decoding any URI scheme or host if it cares about them.
  *
  * The callback also fires when the shell clears the pwd (e.g. an empty
- * OSC 7). In that case GHOSTTY_TERMINAL_DATA_PWD returns a zero-length
- * string.
+ * OSC 7), or when RIS clears a previously reported pwd. In that case
+ * GHOSTTY_TERMINAL_DATA_PWD returns a zero-length string.
  *
  * @param terminal The terminal handle
  * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
@@ -894,8 +894,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
 
   /**
    * Callback invoked when the terminal pwd changes via escape
-   * sequences (OSC 7, OSC 9, or OSC 1337 CurrentDir). Set to NULL
-   * to ignore pwd change events.
+   * sequences (OSC 7, OSC 9, or OSC 1337 CurrentDir), or is cleared by
+   * RIS. Set to NULL to ignore pwd change events.
    *
    * Input type: GhosttyTerminalPwdChangedFn
    */

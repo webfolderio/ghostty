@@ -47,10 +47,16 @@ const TerminalWrapper = struct {
 
 const SearchScreenState = struct {
     searcher: searchpkg.Screen,
+    generation: usize,
     dirty: bool = false,
 
     fn deinit(self: *SearchScreenState) void {
         self.searcher.deinit();
+        self.* = undefined;
+    }
+
+    fn deinitScreenInvalid(self: *SearchScreenState) void {
+        self.searcher.deinitScreenInvalid();
         self.* = undefined;
     }
 };
@@ -93,6 +99,17 @@ const SearchState = struct {
     fn markAllDirty(self: *SearchState) void {
         if (self.primary) |*state| state.dirty = true;
         if (self.alternate) |*state| state.dirty = true;
+    }
+
+    fn discardInvalidScreens(self: *SearchState, screens: *ScreenSet) void {
+        for ([_]ScreenSet.Key{ .primary, .alternate }) |key| {
+            const slot = self.screenState(key);
+            if (slot.*) |*state| {
+                if (state.generation == screens.generation(key)) continue;
+                state.deinitScreenInvalid();
+                slot.* = null;
+            }
+        }
     }
 };
 
@@ -462,6 +479,9 @@ fn initSearchScreenState(
             wrapper.terminal.screens.active,
             needle,
         ),
+        .generation = wrapper.terminal.screens.generation(
+            wrapper.terminal.screens.active_key,
+        ),
     };
     errdefer state.searcher.deinit();
     try state.searcher.searchAll();
@@ -470,6 +490,7 @@ fn initSearchScreenState(
 
 fn syncSearchState(wrapper: *TerminalWrapper) Result {
     const state = if (wrapper.search_state) |*value| value else return .no_value;
+    state.discardInvalidScreens(&wrapper.terminal.screens);
     const screen_state = screen_state: {
         const slot = state.screenState(wrapper.terminal.screens.active_key);
         if (slot.* == null) {
@@ -631,7 +652,10 @@ pub fn vt_write(
 ) callconv(lib.calling_conv) void {
     const wrapper = terminal_ orelse return;
     wrapper.stream.nextSlice(ptr[0..len]);
-    if (wrapper.search_state) |*state| state.markAllDirty();
+    if (wrapper.search_state) |*state| {
+        state.discardInvalidScreens(&wrapper.terminal.screens);
+        state.markAllDirty();
+    }
 }
 
 pub fn search_set(
@@ -1450,7 +1474,10 @@ pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
     for (wrapper.tracked_grid_refs.keys()) |ref| ref.terminal = null;
     wrapper.tracked_grid_refs.deinit(alloc);
     wrapper.stream.deinit();
-    if (wrapper.search_state) |*state| state.deinit(alloc);
+    if (wrapper.search_state) |*state| {
+        state.discardInvalidScreens(&wrapper.terminal.screens);
+        state.deinit(alloc);
+    }
     t.deinit(alloc);
     alloc.destroy(t);
     alloc.destroy(wrapper);
@@ -1704,6 +1731,34 @@ test "search reset while alternate screen is active is safe" {
     try testing.expectEqual(Result.success, search_status(t, &status));
     try testing.expectEqual(@as(usize, 0), status.total);
     try testing.expect(!status.has_selected);
+}
+
+test "search discards an alternate screen removed by RIS" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 16,
+            .rows = 2,
+            .max_scrollback = 32,
+        },
+    ));
+    defer free(t);
+
+    const enter_alt = "\x1B[?1049h";
+    vt_write(t, enter_alt, enter_alt.len);
+    const needle = "alpha";
+    vt_write(t, needle, needle.len);
+    try testing.expectEqual(Result.success, search_set(t, needle, needle.len));
+
+    const ris = "\x1Bc";
+    vt_write(t, ris, ris.len);
+    vt_write(t, enter_alt, enter_alt.len);
+
+    var status: SearchStatus = undefined;
+    try testing.expectEqual(Result.success, search_status(t, &status));
+    try testing.expectEqual(@as(usize, 0), status.total);
 }
 
 test "search set validates pointer" {
@@ -3479,6 +3534,10 @@ test "set pwd_changed callback" {
     vt_write(t, seq2, seq2.len);
     try testing.expectEqual(@as(usize, 2), S.pwd_count);
     try testing.expectEqualStrings("file:///home/user", zigTerminal(t).?.getPwd().?);
+
+    vt_write(t, "\x1Bc", 2);
+    try testing.expectEqual(@as(usize, 3), S.pwd_count);
+    try testing.expectEqual(@as(?[:0]const u8, null), zigTerminal(t).?.getPwd());
 }
 
 test "set clipboard_write callback" {

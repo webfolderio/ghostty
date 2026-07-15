@@ -266,10 +266,12 @@ pub const Handler = struct {
             .active_status_display => self.terminal.status_display = value,
             .decaln => try self.terminal.decaln(),
             .full_reset => {
+                const pwd_changed = self.terminal.getPwd() != null;
                 self.terminal.fullReset();
                 self.default_cursor = true;
                 self.terminal.modes.set(.cursor_blinking, self.default_cursor_blink);
                 self.terminal.screens.active.cursor.cursor_style = self.default_cursor_style;
+                if (pwd_changed) self.notifyPwdChanged();
             },
             .start_hyperlink => try self.terminal.screens.active.startHyperlink(value.uri, value.id),
             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
@@ -521,6 +523,10 @@ pub const Handler = struct {
             return;
         };
 
+        self.notifyPwdChanged();
+    }
+
+    fn notifyPwdChanged(self: *Handler) void {
         const func = self.effects.pwd_changed orelse return;
         func(self);
     }
@@ -1843,6 +1849,14 @@ test "request mode DECRQM with write_pty callback" {
         // Query an unknown mode
         s.nextSlice("\x1B[?9999$p");
         try testing.expectEqualStrings("\x1B[?9999;0$y", S.last_response.?);
+
+        s.nextSlice("\x1B[25l");
+        s.nextSlice("\x1B[25$p");
+        try testing.expectEqualStrings("\x1B[25;2$y", S.last_response.?);
+
+        s.nextSlice("\x1B[25h");
+        s.nextSlice("\x1B[25$p");
+        try testing.expectEqualStrings("\x1B[25;1$y", S.last_response.?);
     }
 }
 

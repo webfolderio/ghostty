@@ -1879,6 +1879,13 @@ pub fn Stream(comptime H: type) type {
                         }
 
                         const mode_raw = input.params[0];
+                        if (mode_raw == 25 and ansi_mode) {
+                            self.handler.vt(.request_mode_unknown, .{
+                                .mode = mode_raw,
+                                .ansi = true,
+                            });
+                            break :decrqm;
+                        }
                         const mode = modes.modeFromInt(mode_raw, ansi_mode);
                         if (mode) |m| {
                             self.handler.vt(.request_mode, .{ .mode = m });
