@@ -201,6 +201,41 @@ pub const ScreenSearch = struct {
         return self.active_results.items.len + self.history_results.items.len;
     }
 
+    pub fn matchAt(self: *const ScreenSearch, index: usize) ?FlattenedHighlight {
+        const active_len = self.active_results.items.len;
+        if (index < active_len) {
+            return self.active_results.items[active_len - 1 - index];
+        }
+
+        const history_index = index - active_len;
+        if (history_index < self.history_results.items.len) {
+            return self.history_results.items[history_index];
+        }
+
+        return null;
+    }
+
+    pub fn selectedIndex(self: *const ScreenSearch) ?usize {
+        return if (self.selected) |selected| selected.idx else null;
+    }
+
+    pub fn selectIndex(self: *ScreenSearch, index: usize) Allocator.Error!bool {
+        _ = try self.resetIfDimensionsChanged();
+        try self.reloadActive();
+        self.pruneHistory();
+
+        const flattened = self.matchAt(index) orelse return false;
+        const tracked = try flattened.untracked().track(self.screen);
+        errdefer tracked.deinit(self.screen);
+
+        if (self.selected) |*selected| selected.deinit(self.screen);
+        self.selected = .{
+            .idx = index,
+            .highlight = tracked,
+        };
+        return true;
+    }
+
     /// Reinitialize cached search state after a screen resize. Reflow can
     /// replace every PageList node, so even flattened highlights that weren't
     /// selected contain invalid node pointers once either dimension changes.

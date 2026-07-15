@@ -90,10 +90,6 @@ const SearchState = struct {
         }
     }
 
-    fn markDirty(self: *SearchState, key: ScreenSet.Key) void {
-        if (self.screenState(key).*) |*state| state.dirty = true;
-    }
-
     fn markAllDirty(self: *SearchState) void {
         if (self.primary) |*state| state.dirty = true;
         if (self.alternate) |*state| state.dirty = true;
@@ -485,9 +481,14 @@ fn syncSearchState(wrapper: *TerminalWrapper) Result {
 
     if (!screen_state.dirty) return .success;
 
+    const dimensions_changed =
+        screen_state.searcher.rows != screen_state.searcher.screen.pages.rows or
+        screen_state.searcher.cols != screen_state.searcher.screen.pages.cols;
     screen_state.searcher.feed() catch return .out_of_memory;
     screen_state.searcher.reloadActive() catch return .out_of_memory;
-    screen_state.searcher.searchAll() catch return .out_of_memory;
+    if (dimensions_changed) {
+        screen_state.searcher.searchAll() catch return .out_of_memory;
+    }
     screen_state.dirty = false;
     return .success;
 }
@@ -525,34 +526,6 @@ fn flattenedIndexedSearchMatch(
     };
 }
 
-fn indexedSearchMatchForHighlight(
-    state: *SearchScreenState,
-    flattened: FlattenedHighlight,
-) ?SearchIndexedMatch {
-    const needle = flattened.untracked();
-    const active_results = state.searcher.active_results.items;
-    var i = active_results.len;
-    while (i > 0) {
-        i -= 1;
-        const idx = active_results.len - 1 - i;
-        if (active_results[i].untracked().eql(needle)) {
-            return flattenedIndexedSearchMatch(state, idx, active_results[i]);
-        }
-    }
-
-    for (state.searcher.history_results.items, 0..) |candidate, history_idx| {
-        if (candidate.untracked().eql(needle)) {
-            return flattenedIndexedSearchMatch(
-                state,
-                active_results.len + history_idx,
-                candidate,
-            );
-        }
-    }
-
-    return null;
-}
-
 fn matchIntersectsViewport(flattened: FlattenedHighlight, screen: *Screen) bool {
     var it = screen.pages.pageIterator(
         .right_down,
@@ -573,18 +546,73 @@ fn matchIntersectsViewport(flattened: FlattenedHighlight, screen: *Screen) bool 
     return false;
 }
 
+const ViewportChunk = struct {
+    serial: u64,
+    start: size.CellCountInt,
+    end: size.CellCountInt,
+};
+
+fn flattenedIntersectsViewport(
+    flattened: FlattenedHighlight,
+    viewport: *const std.AutoHashMapUnmanaged(usize, ViewportChunk),
+) bool {
+    const chunks = flattened.chunks.slice();
+    for (
+        chunks.items(.node),
+        chunks.items(.serial),
+        chunks.items(.start),
+        chunks.items(.end),
+    ) |node, serial, start, end| {
+        const visible = viewport.get(@intFromPtr(node)) orelse continue;
+        if (visible.serial == serial and start < visible.end and visible.start < end) {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn collectViewportMatches(
     alloc: Allocator,
     state: *SearchScreenState,
 ) Allocator.Error!std.ArrayList(SearchIndexedMatch) {
-    var viewport: searchpkg.Viewport = try .init(alloc, state.searcher.needle());
-    defer viewport.deinit();
-    _ = try viewport.update(&state.searcher.screen.pages);
+    var viewport: std.AutoHashMapUnmanaged(usize, ViewportChunk) = .empty;
+    defer viewport.deinit(alloc);
+
+    var it = state.searcher.screen.pages.pageIterator(
+        .right_down,
+        .{ .viewport = .{} },
+        null,
+    );
+    while (it.next()) |chunk| {
+        const entry = try viewport.getOrPut(alloc, @intFromPtr(chunk.node));
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .{
+                .serial = chunk.node.serial,
+                .start = chunk.start,
+                .end = chunk.end,
+            };
+        } else if (entry.value_ptr.serial == chunk.node.serial) {
+            entry.value_ptr.start = @min(entry.value_ptr.start, chunk.start);
+            entry.value_ptr.end = @max(entry.value_ptr.end, chunk.end);
+        } else {
+            entry.value_ptr.* = .{
+                .serial = chunk.node.serial,
+                .start = chunk.start,
+                .end = chunk.end,
+            };
+        }
+    }
 
     var matches: std.ArrayList(SearchIndexedMatch) = .empty;
     errdefer matches.deinit(alloc);
-    while (viewport.next()) |flattened| {
-        const indexed = indexedSearchMatchForHighlight(state, flattened) orelse continue;
+    for (0..state.searcher.matchesLen()) |index| {
+        const flattened = state.searcher.matchAt(index) orelse continue;
+        if (!flattenedIntersectsViewport(flattened, &viewport)) continue;
+        const indexed = flattenedIndexedSearchMatch(
+            state,
+            index,
+            flattened,
+        ) orelse continue;
         try matches.append(alloc, indexed);
     }
 
@@ -592,23 +620,8 @@ fn collectViewportMatches(
 }
 
 fn selectSearchIndex(state: *SearchScreenState, index: usize) Result {
-    const active_len = state.searcher.active_results.items.len;
-    const history_len = state.searcher.history_results.items.len;
-    if (index >= active_len + history_len) return .no_value;
-
-    const flattened = if (index < active_len)
-        state.searcher.active_results.items[active_len - 1 - index]
-    else
-        state.searcher.history_results.items[index - active_len];
-    const tracked = flattened.untracked().track(state.searcher.screen) catch
-        return .out_of_memory;
-
-    if (state.searcher.selected) |*selected| selected.deinit(state.searcher.screen);
-    state.searcher.selected = .{
-        .idx = index,
-        .highlight = tracked,
-    };
-    return .success;
+    const selected = state.searcher.selectIndex(index) catch return .out_of_memory;
+    return if (selected) .success else .no_value;
 }
 
 pub fn vt_write(
@@ -618,7 +631,7 @@ pub fn vt_write(
 ) callconv(lib.calling_conv) void {
     const wrapper = terminal_ orelse return;
     wrapper.stream.nextSlice(ptr[0..len]);
-    if (wrapper.search_state) |*state| state.markDirty(wrapper.terminal.screens.active_key);
+    if (wrapper.search_state) |*state| state.markAllDirty();
 }
 
 pub fn search_set(
@@ -651,14 +664,10 @@ pub fn search_clear(terminal_: Terminal) callconv(lib.calling_conv) Result {
 
 pub fn search_select(
     terminal_: Terminal,
-    direction: SearchDirection,
+    direction_: c_int,
 ) callconv(lib.calling_conv) Result {
-    if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(SearchDirection, @intFromEnum(direction)) catch {
-            log.warn("terminal_search_select invalid direction value={d}", .{@intFromEnum(direction)});
-            return .invalid_value;
-        };
-    }
+    const direction = std.meta.intToEnum(SearchDirection, direction_) catch
+        return .invalid_value;
 
     const wrapper = terminal_ orelse return .invalid_value;
     const sync_result = syncSearchState(wrapper);
@@ -727,8 +736,8 @@ pub fn search_status(
             .has_selected = false,
         };
 
-        if (state.searcher.selected) |selected| {
-            target.selected = selected.idx;
+        if (state.searcher.selectedIndex()) |selected| {
+            target.selected = selected;
             target.has_selected = true;
         }
     }
@@ -771,7 +780,6 @@ pub fn search_viewport_matches_len(
     const alloc = wrapper.terminal.gpa();
     var matches = collectViewportMatches(alloc, state) catch return .out_of_memory;
     defer matches.deinit(alloc);
-
     if (out) |target| target.* = matches.items.len;
     return .success;
 }
@@ -800,9 +808,7 @@ pub fn search_viewport_matches(
 
     if (out_written) |target| target.* = matches.items.len;
     if (out_len < matches.items.len) return .out_of_space;
-    if (matches.items.len == 0) return .success;
-
-    @memcpy(out.?[0..matches.items.len], matches.items);
+    if (matches.items.len > 0) @memcpy(out.?[0..matches.items.len], matches.items);
     return .success;
 }
 
@@ -824,33 +830,20 @@ pub fn search_matches(
     else
         return .no_value;
 
-    const active_len = state.searcher.active_results.items.len;
-    const total = active_len + state.searcher.history_results.items.len;
+    const total = state.searcher.matchesLen();
     if (out_written) |target| target.* = total;
     if (out_len < total) return .out_of_space;
 
     if (total == 0) return .success;
     const target = out.?[0..total];
 
-    var written: usize = 0;
-    var i = active_len;
-    while (i > 0) {
-        i -= 1;
-        target[written] = flattenedIndexedSearchMatch(
+    for (0..total) |index| {
+        const flattened = state.searcher.matchAt(index) orelse return .no_value;
+        target[index] = flattenedIndexedSearchMatch(
             state,
-            written,
-            state.searcher.active_results.items[i],
-        ) orelse return .no_value;
-        written += 1;
-    }
-
-    for (state.searcher.history_results.items, 0..) |flattened, history_idx| {
-        target[written] = flattenedIndexedSearchMatch(
-            state,
-            active_len + history_idx,
+            index,
             flattened,
         ) orelse return .no_value;
-        written += 1;
     }
 
     return .success;

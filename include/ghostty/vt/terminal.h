@@ -341,6 +341,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_TERMINAL_SEARCH_DIRECTION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalSearchDirection;
 
+/* Search indices are ordered newest-to-oldest and are stable until mutation. */
 typedef struct {
   size_t total;
   size_t selected;
